@@ -9,6 +9,7 @@ const phpvms   = require('./phpvms');
 const embeds   = require('./embeds');
 const roles    = require('./roles');
 const startWebhook = require('./webhook');
+const startApproachMonitor = require('./approach');
 
 const client = new Client({
   intents: [
@@ -54,6 +55,7 @@ client.once(Events.ClientReady, async () => {
 
   // Start webhook server
   startWebhook(client);
+  startApproachMonitor(client);
 
   console.log(`[LBA BOT] Ready. Webhook on port ${process.env.WEBHOOK_PORT || 3000}`);
 });
