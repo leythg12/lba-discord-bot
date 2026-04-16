@@ -1,8 +1,6 @@
 /**
  * Express webhook server
  * phpVMS posts here when a pilot links their Discord account via OAuth
- *
- * phpVMS sends: { discord_id, user_id, pilot_id, event }
  */
 const express = require('express');
 const crypto  = require('crypto');
@@ -11,7 +9,6 @@ module.exports = function startWebhook(client) {
   const app = express();
   app.use(express.json());
 
-  // ── Signature verification ────────────────────────────────────
   function verifySignature(req) {
     const secret    = process.env.WEBHOOK_SECRET;
     const signature = req.headers['x-lba-signature'] || '';
@@ -20,30 +17,27 @@ module.exports = function startWebhook(client) {
       .createHmac('sha256', secret)
       .update(payload)
       .digest('hex');
-    return crypto.timingSafeEqual(
-      Buffer.from(signature),
-      Buffer.from(expected)
-    );
+    try {
+      return crypto.timingSafeEqual(
+        Buffer.from(signature),
+        Buffer.from(expected)
+      );
+    } catch(e) { return false; }
   }
 
-  // ── Health check ──────────────────────────────────────────────
+  // Health check
   app.get('/health', (req, res) => {
-    res.json({ status: 'ok', bot: client.user?.tag });
+    res.json({ status: 'ok', bot: client.user?.tag || 'starting' });
   });
 
-  // ── Main webhook endpoint ─────────────────────────────────────
+  // Main webhook endpoint
   app.post('/webhook/discord-linked', async (req, res) => {
-    // Verify signature
-    try {
-      if (!verifySignature(req)) {
-        console.warn('[WEBHOOK] Invalid signature');
-        return res.status(401).json({ error: 'Invalid signature' });
-      }
-    } catch (e) {
-      return res.status(401).json({ error: 'Signature error' });
+    if (!verifySignature(req)) {
+      console.warn('[WEBHOOK] Invalid signature');
+      return res.status(401).json({ error: 'Invalid signature' });
     }
 
-    const { discord_id, user_id, pilot_id, event } = req.body;
+    const { discord_id, event, pilot_id, name, rank, hub, flights, flight_time, balance } = req.body;
 
     if (event !== 'discord.linked') {
       return res.json({ status: 'ignored', event });
@@ -53,72 +47,90 @@ module.exports = function startWebhook(client) {
       return res.status(400).json({ error: 'Missing discord_id' });
     }
 
-    console.log(`[WEBHOOK] Discord linked: discord_id=${discord_id} pilot_id=${pilot_id}`);
+    console.log(`[WEBHOOK] Discord linked: discord_id=${discord_id} pilot_id=${pilot_id} name=${name}`);
 
-    // Respond immediately — process async
+    // Respond immediately
     res.json({ status: 'received' });
 
     // Process in background
     setImmediate(async () => {
       try {
         const guild = client.guilds.cache.first();
-        if (!guild) return;
+        if (!guild) { console.warn('[WEBHOOK] No guild found'); return; }
 
-        // Find the Discord member
+        // Fetch the Discord member
         let member;
         try {
           member = await guild.members.fetch(discord_id);
         } catch (e) {
-          console.warn(`[WEBHOOK] Member ${discord_id} not in guild`);
+          console.warn(`[WEBHOOK] Member ${discord_id} not in guild:`, e.message);
           return;
         }
 
-        // Get pilot data from phpVMS
-        const phpvms = require('./phpvms');
-        const roles  = require('./roles');
         const embeds = require('./embeds');
+        const phpvms = require('./phpvms');
 
-        let pilot = null;
-        if (user_id) pilot = await phpvms.getPilotById(user_id);
-        if (!pilot && pilot_id) pilot = await phpvms.getPilotByPilotId(pilot_id);
-        if (!pilot) pilot = await phpvms.getPilotByDiscordId(discord_id);
-
-        if (!pilot) {
-          console.warn(`[WEBHOOK] No pilot found for discord_id=${discord_id}`);
-          return;
-        }
+        // Build pilot object from webhook payload directly
+        const pilot = {
+          pilot_id,
+          name,
+          rank:            { name: rank || 'Student Pilot' },
+          home_airport_id: hub || 'LFBD',
+          flights:         flights || 0,
+          flight_time:     flight_time || 0,
+          balance:         balance || 0,
+        };
 
         // Assign roles
-        await roles.assignFromPilot(member, pilot);
+        const allRanks = [
+          process.env.ROLE_STUDENT, process.env.ROLE_SECOND_OFFICER,
+          process.env.ROLE_FIRST_OFFICER, process.env.ROLE_SENIOR_FO,
+          process.env.ROLE_CAPTAIN, process.env.ROLE_SENIOR_CAPTAIN,
+          process.env.ROLE_CHIEF_PILOT,
+        ].filter(Boolean);
 
-        // Send success DM
+        const allHubs = [
+          process.env.ROLE_HUB_LFBD,
+          process.env.ROLE_HUB_LFPG,
+        ].filter(Boolean);
+
+        const remove = [...allRanks, ...allHubs, process.env.ROLE_UNVERIFIED].filter(Boolean);
+        const add    = [];
+
+        const rankRole = phpvms.rankToRoleId(pilot.rank.name);
+        if (rankRole) add.push(rankRole);
+
+        const hubRole = phpvms.hubToRoleId(pilot.home_airport_id);
+        if (hubRole) add.push(hubRole);
+
+        if (process.env.ROLE_PILOT) add.push(process.env.ROLE_PILOT);
+
+        await member.roles.remove(remove.filter(r => member.roles.cache.has(r))).catch(()=>{});
+        await member.roles.add(add.filter(r => !member.roles.cache.has(r))).catch(()=>{});
+        await member.setNickname(`${name} | ${pilot_id}`).catch(()=>{});
+
+        console.log(`[WEBHOOK] Roles assigned to ${member.user.tag}`);
+
+        // DM the pilot
         try {
           await member.send({ embeds: [embeds.verifySuccess(pilot)] });
         } catch (e) {
-          // DMs may be disabled — post in verify channel instead
           const ch = guild.channels.cache.get(process.env.VERIFY_CHANNEL_ID);
-          if (ch) {
-            await ch.send({
-              content: `<@${discord_id}>`,
-              embeds: [embeds.verifySuccess(pilot)],
-            });
-          }
+          if (ch) await ch.send({ content: `<@${discord_id}>`, embeds: [embeds.verifySuccess(pilot)] });
         }
 
         // Log
         const logCh = guild.channels.cache.get(process.env.LOG_CHANNEL_ID);
         logCh?.send(
-          `\`${new Date().toISOString()}\` ✅ Verified via OAuth: **${member.user.tag}** → ${pilot.name} (${pilot.pilot_id}) · ${pilot.rank?.name||'?'} · Hub ${pilot.home_airport_id}`
-        ).catch(() => {});
+          `\`${new Date().toISOString()}\` ✅ Verified: **${member.user.tag}** → ${name} (${pilot_id}) · ${rank} · Hub ${hub}`
+        ).catch(()=>{});
 
       } catch (e) {
-        console.error('[WEBHOOK] Processing error:', e.message);
+        console.error('[WEBHOOK] Error:', e.message);
       }
     });
   });
 
   const port = process.env.WEBHOOK_PORT || 3000;
-  app.listen(port, () => {
-    console.log(`[WEBHOOK] Listening on port ${port}`);
-  });
+  app.listen(port, () => console.log(`[WEBHOOK] Listening on port ${port}`));
 };
