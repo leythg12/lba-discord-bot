@@ -2,6 +2,7 @@ require('dotenv').config();
 const {
   Client, GatewayIntentBits, Partials, Events,
   ActionRowBuilder, ButtonBuilder, ButtonStyle,
+  MessageFlags,
 } = require('discord.js');
 const cron     = require('node-cron');
 const phpvms   = require('./phpvms');
@@ -45,7 +46,7 @@ client.once(Events.ClientReady, async () => {
   console.log(`[LBA BOT] Online as ${client.user.tag}`);
   client.user.setActivity('Liberté Air Virtual · LBA', { type: 3 });
 
-  // Seed last IDs
+  // Seed last IDs to avoid re-posting old content
   const pireps = await phpvms.getLatestPireps(1);
   if (pireps[0]) lastPirepId = pireps[0].id;
   const news = await phpvms.getLatestNews(1);
@@ -54,7 +55,7 @@ client.once(Events.ClientReady, async () => {
   // Start webhook server
   startWebhook(client);
 
-  console.log(`[LBA BOT] Ready. Webhook listening on port ${process.env.WEBHOOK_PORT || 3000}`);
+  console.log(`[LBA BOT] Ready. Webhook on port ${process.env.WEBHOOK_PORT || 3000}`);
 });
 
 // ── New member ──────────────────────────────────────────────────────
@@ -73,27 +74,16 @@ client.on(Events.InteractionCreate, async interaction => {
 
   // ── BUTTON: verify ───────────────────────────────────────────────
   if (interaction.isButton() && interaction.customId === 'verify_oauth') {
-    await interaction.deferReply({ ephemeral: true });
-
-    // First check if already linked in phpVMS
-    const pilot = await phpvms.getPilotByDiscordId(interaction.user.id);
-
-    if (pilot) {
-      // Already linked — just assign roles
-      await roles.assignFromPilot(interaction.member, pilot);
-      return interaction.editReply({ embeds: [embeds.verifySuccess(pilot)] });
-    }
-
-    // Not linked yet — send them to the crew center
     const loginUrl = `${process.env.PHPVMS_URL}/login`;
-    return interaction.editReply({
+    return interaction.reply({
+      flags: MessageFlags.Ephemeral,
       embeds: [
         embeds.verifyNotFound().setDescription(
           '**Étapes pour vérifier votre compte :**\n\n' +
           `> **1.** Cliquez sur ce lien : [Connexion avec Discord](${loginUrl})\n` +
           '> **2.** Connectez-vous avec votre compte **Discord**\n' +
-          '> **3.** Vos rôles seront attribués **automatiquement** dans les secondes qui suivent ✅\n\n' +
-          '💡 Si vous n\'avez pas encore de compte : [Inscrivez-vous](https://newhorisons.com/register)'
+          '> **3.** Vos rôles seront attribués **automatiquement** ✅\n\n' +
+          '💡 Pas encore de compte ? [Inscrivez-vous ici](https://newhorisons.com/register)'
         )
       ],
     });
@@ -103,20 +93,10 @@ client.on(Events.InteractionCreate, async interaction => {
 
   // ── /verify ──────────────────────────────────────────────────────
   if (interaction.commandName === 'verify') {
-    await interaction.deferReply({ ephemeral: true });
-
-    const pilot = await phpvms.getPilotByDiscordId(interaction.user.id);
-
-    if (pilot) {
-      await roles.assignFromPilot(interaction.member, pilot);
-      await interaction.editReply({ embeds: [embeds.verifySuccess(pilot)] });
-      await log(interaction.guild, `✅ Verified: **${interaction.user.tag}** → ${pilot.name} (${pilot.pilot_id})`);
-      return;
-    }
-
     const loginUrl = `${process.env.PHPVMS_URL}/login`;
-    return interaction.editReply({
-      content: `Votre Discord n'est pas encore lié à un compte LBA.\n\n👉 Connectez-vous avec Discord ici : ${loginUrl}\n\nVos rôles seront attribués automatiquement ensuite.`,
+    return interaction.reply({
+      flags: MessageFlags.Ephemeral,
+      content: `Pour vérifier votre compte, connectez-vous avec Discord ici :\n👉 ${loginUrl}\n\nVos rôles seront attribués automatiquement après connexion.`,
     });
   }
 
@@ -151,19 +131,28 @@ client.on(Events.InteractionCreate, async interaction => {
       embeds: [embeds.verifyPanel()],
       components: [verifyRow()],
     });
-    await interaction.reply({ content: '✅ Panel posté.', ephemeral: true });
+    await interaction.reply({
+      flags: MessageFlags.Ephemeral,
+      content: '✅ Panel posté.',
+    });
   }
 
   // ── /sync (admin) ────────────────────────────────────────────────
   if (interaction.commandName === 'sync') {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const target = interaction.options.getMember('user');
     const rawId  = interaction.options.getString('pilot_id').trim().toUpperCase();
     const pilot  = await phpvms.getPilotByPilotId(rawId);
-    if (!pilot) return interaction.editReply({ embeds: [embeds.error(`Pilote ${rawId} introuvable.`)] });
+    if (!pilot) return interaction.editReply({
+      embeds: [embeds.error(`Pilote ${rawId} introuvable.`)]
+    });
     await roles.assignFromPilot(target, pilot);
-    await interaction.editReply({ content: `✅ Rôles synchronisés pour **${target.user.tag}** → ${pilot.name}` });
-    await log(interaction.guild, `🔄 Sync par ${interaction.user.tag} : **${target.user.tag}** → ${rawId}`);
+    await interaction.editReply({
+      content: `✅ Rôles synchronisés pour **${target.user.tag}** → ${pilot.name}`
+    });
+    await log(interaction.guild,
+      `🔄 Sync par ${interaction.user.tag} : **${target.user.tag}** → ${rawId}`
+    );
   }
 });
 
